@@ -10,7 +10,7 @@ from fpdf import FPDF
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ChatMemberHandler, ConversationHandler, ContextTypes, filters
@@ -21,11 +21,13 @@ import database as db
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+ROOT_ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "Course Payment Receipt")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DIVIDER = "─" * 24
 
 # temp holding area for a payment entry awaiting confirmation: {admin_id: {...}}
 PENDING = {}
@@ -34,9 +36,27 @@ PENDING = {}
 ASK_NAME, ASK_USERNAME, ASK_USERID, ASK_COURSE, ASK_SCREENSHOT = range(5)
 
 
+def is_authorized(user_id: int) -> bool:
+    if user_id == ROOT_ADMIN_ID:
+        return True
+    return db.is_admin_in_db(user_id)
+
+
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID:
+        if not is_authorized(update.effective_user.id):
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def root_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ROOT_ADMIN_ID:
+            await update.message.reply_text(
+                "⛔ Ye command sirf *Primary Admin* use kar sakta hai.",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
         return await func(update, context)
     return wrapper
@@ -48,14 +68,86 @@ def admin_only(func):
 
 @admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_root = update.effective_user.id == ROOT_ADMIN_ID
+    lines = [
+        f"🎓 *{BUSINESS_NAME}*",
+        DIVIDER,
+        "*Payment Management:*",
+        "  /addpayment — Nayi payment entry add karein",
+        "  /check `<user_id>` — Student ki complete profile dekhein",
+        "  /channels — Sabhi channels ki list",
+        "  /cancel — Chal rahi process cancel karein",
+    ]
+    if is_root:
+        lines += [
+            "",
+            "*Admin Management* _(Primary Admin only)_:",
+            "  /addadmin `<user_id>` — Naya admin add karein",
+            "  /removeadmin `<user_id>` — Admin access remove karein",
+            "  /listadmins — Sabhi admins ki list",
+        ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# ---------------------------------------------------------------------------
+# Admin management
+# ---------------------------------------------------------------------------
+
+@admin_only
+async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Sahi format: `/addadmin 123456789`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    new_id = int(context.args[0])
+    if new_id == ROOT_ADMIN_ID or db.is_admin_in_db(new_id):
+        await update.message.reply_text("Ye user pehle se hi admin access rakhta hai.")
+        return
+    db.add_admin(new_id, added_by=update.effective_user.id)
+
+    display_name = str(new_id)
+    try:
+        chat = await context.bot.get_chat(new_id)
+        display_name = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or str(new_id)
+    except Exception:
+        pass
+
     await update.message.reply_text(
-        "Bot active hai.\n\n"
-        "Available commands:\n"
-        "/addpayment — payment entry step-by-step add karne ke liye\n"
-        "/check <user_id> — user ki complete details\n"
-        "/channels — sabhi channels ki list\n"
-        "/cancel — chal rahi entry process cancel karne ke liye"
+        f"✅ *Naya Admin Add Kiya Gaya*\n{DIVIDER}\n"
+        f"Naam: {display_name}\nUser ID: `{new_id}`\n\n"
+        f"Is user ke paas ab wahi access hai jo aapke paas hai — /addpayment, /check, /channels, sab kuch.",
+        parse_mode=ParseMode.MARKDOWN
     )
+
+
+@admin_only
+@root_only
+async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Sahi format: `/removeadmin 123456789`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    target_id = int(context.args[0])
+    if target_id == ROOT_ADMIN_ID:
+        await update.message.reply_text("Primary Admin ko remove nahi kiya ja sakta.")
+        return
+    removed = db.remove_admin(target_id)
+    if removed:
+        await update.message.reply_text(f"✅ User `{target_id}` ka admin access remove kar diya gaya hai.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("Ye user admin list mein mila nahi.")
+
+
+@admin_only
+async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admins = db.get_all_admins()
+    lines = [f"👑 *Admin List*", DIVIDER, f"• `{ROOT_ADMIN_ID}` — Primary Admin"]
+    for a in admins:
+        added = a["added_at"].strftime("%d %b %Y") if a.get("added_at") else "—"
+        lines.append(f"• `{a['_id']}` — added on {added}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -63,12 +155,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def addpayment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text(
-        "Payment entry process shuru ho rahi hai.\n\n"
-        "Student ka naam bataiye:"
+        f"📝 *Nayi Payment Entry*\n{DIVIDER}\nStudent ka naam bataiye:",
+        parse_mode=ParseMode.MARKDOWN
     )
     return ASK_NAME
 
@@ -88,7 +180,7 @@ async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_userid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.isdigit():
-        await update.message.reply_text("User ID sirf numbers mein hona chahiye. Kripya dobara bhejein:")
+        await update.message.reply_text("⚠️ User ID sirf numbers mein hona chahiye. Kripya dobara bhejein:")
         return ASK_USERID
     context.user_data["user_id"] = int(text)
     await update.message.reply_text("Course ya batch ka naam bataiye:")
@@ -97,7 +189,7 @@ async def ask_userid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["course"] = update.message.text.strip()
-    await update.message.reply_text("Ab payment screenshot bhejein.")
+    await update.message.reply_text("📸 Ab payment screenshot bhejein.")
     return ASK_SCREENSHOT
 
 
@@ -118,7 +210,7 @@ def extract_amount_and_date(ocr_text: str):
 
 async def ask_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
-        await update.message.reply_text("Kripya payment screenshot bhejein (image format mein).")
+        await update.message.reply_text("⚠️ Kripya payment screenshot bhejein (image format mein).")
         return ASK_SCREENSHOT
 
     photo = update.message.photo[-1]
@@ -147,8 +239,8 @@ async def ask_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "screenshot_file_id": photo.file_id,
     }
 
-    amount_display = amount if amount else "❓ Detect nahi hua, manually set karein"
-    date_display = date_val if date_val else "❓ Detect nahi hua, manually set karein (YYYY-MM-DD)"
+    amount_display = f"₹{amount}" if amount else "❓ Detect nahi hua — /fixamount se set karein"
+    date_display = date_val if date_val else "❓ Detect nahi hua — /fixdate se set karein"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm & Save", callback_data="confirm_payment")],
@@ -156,17 +248,17 @@ async def ask_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     await update.message.reply_text(
-        f"📋 Entry Preview\n\n"
-        f"Name: {data['name']}\n"
-        f"Username: {data['username']}\n"
-        f"UserID: {data['user_id']}\n"
-        f"Course: {data['course']}\n"
-        f"Amount: {amount_display}\n"
-        f"Date: {date_display}\n\n"
-        f"Agar amount ya date incorrect hai, confirm karne se pehle correct karein:\n"
+        f"📋 *Entry Preview*\n{DIVIDER}\n"
+        f"*Name:* {data['name']}\n"
+        f"*Username:* {data['username']}\n"
+        f"*User ID:* `{data['user_id']}`\n"
+        f"*Course:* {data['course']}\n"
+        f"*Amount:* {amount_display}\n"
+        f"*Date:* {date_display}\n\n"
+        f"_Amount ya date galat ho to confirm se pehle:_\n"
         f"`/fixamount 1499` ya `/fixdate 2026-01-12`",
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -189,10 +281,10 @@ async def fix_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Koi pending entry nahi hai.")
         return
     if not context.args:
-        await update.message.reply_text("Sahi format: /fixamount 1499")
+        await update.message.reply_text("Sahi format: `/fixamount 1499`", parse_mode=ParseMode.MARKDOWN)
         return
     pending["amount"] = context.args[0]
-    await update.message.reply_text(f"Amount update kar diya gaya hai: {pending['amount']}")
+    await update.message.reply_text(f"✅ Amount update ho gaya: ₹{pending['amount']}")
 
 
 @admin_only
@@ -202,10 +294,10 @@ async def fix_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Koi pending entry nahi hai.")
         return
     if not context.args:
-        await update.message.reply_text("Sahi format: /fixdate 2026-01-12")
+        await update.message.reply_text("Sahi format: `/fixdate 2026-01-12`", parse_mode=ParseMode.MARKDOWN)
         return
     pending["date"] = context.args[0]
-    await update.message.reply_text(f"Date update kar diya gaya hai: {pending['date']}")
+    await update.message.reply_text(f"✅ Date update ho gaya: {pending['date']}")
 
 
 def parse_flexible_date(raw: str):
@@ -227,15 +319,18 @@ def generate_receipt_pdf(receipt_no, data, purchase_date):
     pdf = FPDF()
     pdf.add_page()
 
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 12, BUSINESS_NAME, ln=True, align="C")
+    pdf.set_fill_color(30, 30, 40)
+    pdf.rect(0, 0, 210, 30, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_xy(0, 8)
+    pdf.cell(210, 10, BUSINESS_NAME, align="C")
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, "Payment Receipt", ln=True, align="C")
-    pdf.ln(6)
+    pdf.set_xy(0, 18)
+    pdf.cell(210, 8, "Official Payment Receipt", align="C")
 
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(6)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(40)
 
     pdf.set_font("Helvetica", "", 11)
     rows = [
@@ -247,16 +342,24 @@ def generate_receipt_pdf(receipt_no, data, purchase_date):
         ("Course", data["course"]),
         ("Amount Paid", f"Rs. {data['amount']}"),
     ]
+    fill = False
     for label, value in rows:
+        pdf.set_fill_color(245, 245, 245)
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(50, 9, label, border=0)
+        pdf.cell(55, 10, f"  {label}", border=0, fill=fill)
         pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 9, str(value), ln=True)
+        pdf.cell(0, 10, str(value), ln=True, fill=fill)
+        fill = not fill
 
-    pdf.ln(8)
+    pdf.ln(10)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
     pdf.set_font("Helvetica", "I", 9)
     pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(0, 6, "This is a system-generated receipt confirming the payment recorded above.")
+    pdf.multi_cell(0, 6, "This is a system-generated receipt confirming the payment recorded above. "
+                          "Please retain this for your records.")
 
     filename = f"/tmp/receipt_{data['user_id']}_{receipt_no}.pdf"
     pdf.output(filename)
@@ -284,14 +387,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if not pending.get("amount") or not pending.get("date"):
             await query.edit_message_text(
-                "Amount ya date abhi bhi missing hai. Pehle /fixamount aur /fixdate se set karein, "
+                "⚠️ Amount ya date abhi bhi missing hai. Pehle /fixamount aur /fixdate se set karein, "
                 "phir dobara Confirm button press karein."
             )
             return
         try:
             purchase_date = parse_flexible_date(pending["date"])
         except Exception:
-            await query.edit_message_text("Date sahi format mein nahi hai. Kripya /fixdate 2026-01-12 format use karein.")
+            await query.edit_message_text("Date sahi format mein nahi hai. Kripya `/fixdate 2026-01-12` format use karein.")
             return
 
         receipt_id = db.add_purchase(
@@ -321,7 +424,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(pdf_path)
 
         PENDING.pop(update.effective_user.id, None)
-        await query.edit_message_text("✅ Entry safaltapoorvak save ho gayi hai.")
+        await query.edit_message_text(
+            f"✅ *Entry Successfully Saved*\n{DIVIDER}\nReceipt No.: `{receipt_id[-8:].upper()}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +437,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Sahi format: /check 123456789")
+        await update.message.reply_text("Sahi format: `/check 123456789`", parse_mode=ParseMode.MARKDOWN)
         return
     try:
         user_id = int(context.args[0])
@@ -355,42 +461,46 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    lines = [f"👤 User ID: {user_id}"]
+    lines = [f"👤 *Student Profile*", DIVIDER, f"*User ID:* `{user_id}`"]
 
     if purchases:
         purchase_name = purchases[0]["name_at_purchase"]
         purchase_username = purchases[0]["username_at_purchase"]
-        lines.append(f"Name (purchase ke samay): {purchase_name}")
+        lines.append(f"*Name (at purchase):* {purchase_name}")
         if current_name and current_name != purchase_name:
-            lines.append(f"Name (current): {current_name} ⚠️ (change ho chuka hai)")
+            lines.append(f"*Name (current):* {current_name} ⚠️ _(changed)_")
         elif current_name:
-            lines.append(f"Name (current): {current_name} (unchanged)")
-        lines.append(f"Username (purchase ke samay): {purchase_username}")
+            lines.append(f"*Name (current):* {current_name} ✓ _(unchanged)_")
+        lines.append(f"*Username (at purchase):* {purchase_username}")
         if current_username:
-            lines.append(f"Username (current): {current_username}")
+            lines.append(f"*Username (current):* {current_username}")
     elif current_name:
-        lines.append(f"Name: {current_name}")
-        lines.append(f"Username: {current_username}")
+        lines.append(f"*Name:* {current_name}")
+        lines.append(f"*Username:* {current_username}")
 
     lines.append("")
+    lines.append(f"📚 *Purchase History*")
+    lines.append(DIVIDER)
     if purchases:
-        lines.append("📚 Purchase History:")
+        total = sum(float(p["amount"]) for p in purchases if p.get("amount"))
         for p in purchases:
-            lines.append(f"  • {p['course_name']} — ₹{p['amount']} — {p['purchase_date']}")
+            lines.append(f"• {p['course_name']} — ₹{p['amount']} — {p['purchase_date']}")
+        lines.append(f"\n*Total Paid:* ₹{total:,.0f}")
     else:
-        lines.append("📚 Koi purchase record uplabdh nahi hai.")
+        lines.append("_Koi purchase record uplabdh nahi hai._")
 
     lines.append("")
+    lines.append(f"📢 *Channel Membership*")
+    lines.append(DIVIDER)
     if channels:
-        lines.append("📢 Active Channels:")
         for c in channels:
             joined = c["joined_at"].strftime("%d %b %Y") if c["joined_at"] else "—"
             link = c["invite_link"] or "(link uplabdh nahi hai)"
-            lines.append(f"  • {c['title']} — joined on {joined}\n    {link}")
+            lines.append(f"• {c['title']} — joined {joined}\n  {link}")
     else:
-        lines.append("📢 User is samay kisi bhi channel mein active nahi hai.")
+        lines.append("_User is samay kisi bhi channel mein active nahi hai._")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +517,13 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     keyboard = [
-        [InlineKeyboardButton(c["title"] or str(c["channel_id"]), callback_data=f"chinfo_{c['channel_id']}")]
+        [InlineKeyboardButton(f"📢 {c['title'] or c['channel_id']}", callback_data=f"chinfo_{c['channel_id']}")]
         for c in channels
     ]
     await update.message.reply_text(
-        "📢 Registered Channels:", reply_markup=InlineKeyboardMarkup(keyboard)
+        f"📢 *Registered Channels* ({len(channels)})",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
     )
 
 
@@ -426,84 +538,4 @@ async def channel_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     title = channels.get(channel_id, {}).get("title", str(channel_id))
 
     if not members:
-        await query.edit_message_text(f"📢 {title}\nIs channel mein abhi koi active member nahi hai.")
-        return
-
-    lines = [f"📢 {title}", f"Total Active Members: {len(members)}", ""]
-    for m in members:
-        joined = m["joined_at"].strftime("%d %b %Y") if m["joined_at"] else "—"
-        lines.append(f"  • UserID: {m['user_id']} — joined on {joined}")
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3990] + "\n...(list truncated hai)"
-    await query.edit_message_text(text)
-
-
-# ---------------------------------------------------------------------------
-# Channel membership tracking (bot must be admin in the channel)
-# ---------------------------------------------------------------------------
-
-async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = update.chat_member
-    if result is None:
-        return
-
-    chat = result.chat
-    user = result.new_chat_member.user
-    old_status = result.old_chat_member.status
-    new_status = result.new_chat_member.status
-
-    invite_link = None
-    try:
-        invite_link = await context.bot.export_chat_invite_link(chat.id)
-    except Exception:
-        pass
-    db.register_channel(chat.id, chat.title, invite_link)
-
-    was_member = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    is_member = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-
-    if not was_member and is_member:
-        db.log_join(user.id, chat.id)
-    elif was_member and not is_member:
-        db.log_leave(user.id, chat.id)
-
-
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
-def main():
-    db.init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_user))
-    app.add_handler(CommandHandler("channels", list_channels))
-    app.add_handler(CommandHandler("fixamount", fix_amount))
-    app.add_handler(CommandHandler("fixdate", fix_date))
-
-    addpayment_conv = ConversationHandler(
-        entry_points=[CommandHandler("addpayment", addpayment_start)],
-        states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_username)],
-            ASK_USERID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_userid)],
-            ASK_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_course)],
-            ASK_SCREENSHOT: [MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), ask_screenshot)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(addpayment_conv)
-
-    app.add_handler(CallbackQueryHandler(channel_info_button, pattern=r"^chinfo_"))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(confirm_payment|cancel_payment)$"))
-
-    app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+        await query.edit_message_text(f"📢 *{title}*\n\nIs channel mein abhi koi active member nahi ha
