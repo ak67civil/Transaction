@@ -17,7 +17,6 @@ def _masked_uri_debug():
     uri = MONGODB_URI
     has_leading_trailing_space = uri != uri.strip()
     has_quotes = uri.startswith('"') or uri.startswith("'") or uri.endswith('"') or uri.endswith("'")
-    # mask everything between :// and @ (credentials), show only lengths
     if "@" in uri:
         cred_part, host_part = uri.split("@", 1)
         masked = f"{cred_part[:12]}...(len={len(cred_part)})@{host_part}"
