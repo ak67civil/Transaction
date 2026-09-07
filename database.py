@@ -59,7 +59,7 @@ def upsert_user(user_id):
 def add_purchase(user_id, name, username, course_name, amount, purchase_date, screenshot_file_id):
     upsert_user(user_id)
     db = get_db()
-    db.purchases.insert_one({
+    result = db.purchases.insert_one({
         "user_id": user_id,
         "name_at_purchase": name,
         "username_at_purchase": username,
@@ -69,6 +69,7 @@ def add_purchase(user_id, name, username, course_name, amount, purchase_date, sc
         "screenshot_file_id": screenshot_file_id,
         "added_at": datetime.utcnow(),
     })
+    return str(result.inserted_id)
 
 
 def get_purchases(user_id):
