@@ -537,5 +537,4 @@ async def channel_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     channels = {c["channel_id"]: c for c in db.get_all_channels()}
     title = channels.get(channel_id, {}).get("title", str(channel_id))
 
-    if not members:
-        await query.edit_message_text(f"📢 *{title}*\n\nIs channel mein abhi koi active member nahi ha
+    await query.edit_message_text(f"📢 *{title}*\n\nIs channel mein abhi koi active member nahi hai.")
