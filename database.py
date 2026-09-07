@@ -143,3 +143,32 @@ def get_channel_members(channel_id):
         {"channel_id": channel_id, "status": "active"}
     ).sort("joined_at", 1))
     return [{"user_id": d["user_id"], "joined_at": d["joined_at"]} for d in docs]
+
+
+# ---------------------------------------------------------------------------
+# Multi-admin management
+# ---------------------------------------------------------------------------
+
+def add_admin(user_id, added_by):
+    db = get_db()
+    db.admins.update_one(
+        {"_id": user_id},
+        {"$setOnInsert": {"added_by": added_by, "added_at": datetime.utcnow()}},
+        upsert=True
+    )
+
+
+def remove_admin(user_id):
+    db = get_db()
+    result = db.admins.delete_one({"_id": user_id})
+    return result.deleted_count > 0
+
+
+def is_admin_in_db(user_id):
+    db = get_db()
+    return db.admins.find_one({"_id": user_id}) is not None
+
+
+def get_all_admins():
+    db = get_db()
+    return list(db.admins.find().sort("added_at", 1))
