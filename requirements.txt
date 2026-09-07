@@ -3,3 +3,4 @@ pymongo==4.10.1
 pytesseract==0.3.13
 Pillow==10.4.0
 python-dotenv==1.0.1
+fpdf2==2.7.9
