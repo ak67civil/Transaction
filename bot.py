@@ -6,13 +6,14 @@ from io import BytesIO
 
 from PIL import Image
 import pytesseract
+from fpdf import FPDF
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ChatMemberHandler, ContextTypes, filters
+    ChatMemberHandler, ConversationHandler, ContextTypes, filters
 )
 
 import database as db
@@ -21,12 +22,16 @@ load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "Course Payment Receipt")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# temp holding area for a payment entry being confirmed: {admin_id: {...}}
+# temp holding area for a payment entry awaiting confirmation: {admin_id: {...}}
 PENDING = {}
+
+# Conversation states for /addpayment
+ASK_NAME, ASK_USERNAME, ASK_USERID, ASK_COURSE, ASK_SCREENSHOT = range(5)
 
 
 def admin_only(func):
@@ -38,7 +43,7 @@ def admin_only(func):
 
 
 # ---------------------------------------------------------------------------
-# /start and /addpayment (format helper)
+# /start
 # ---------------------------------------------------------------------------
 
 @admin_only
@@ -46,41 +51,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot active hai.\n\n"
         "Available commands:\n"
-        "/addpayment — payment entry ka format dekhne ke liye\n"
+        "/addpayment — payment entry step-by-step add karne ke liye\n"
         "/check <user_id> — user ki complete details\n"
-        "/channels — sabhi channels ki list"
+        "/channels — sabhi channels ki list\n"
+        "/cancel — chal rahi entry process cancel karne ke liye"
     )
 
 
-@admin_only
-async def addpayment_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------------------
+# /addpayment - step-by-step conversation
+# ---------------------------------------------------------------------------
+
+async def addpayment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text(
-        "Payment entry add karne ke liye payment screenshot bhejein, caption mein niche diya format use karein:\n\n"
-        "Name: Rahul Sharma\n"
-        "Username: @rahul123\n"
-        "UserID: 123456789\n"
-        "Course: Digital Marketing Batch 2\n\n"
-        "Amount aur date screenshot se automatically detect kiye jayenge. Confirmation ke baad entry save ho jayegi."
+        "Payment entry process shuru ho rahi hai.\n\n"
+        "Student ka naam bataiye:"
     )
+    return ASK_NAME
 
 
-# ---------------------------------------------------------------------------
-# Photo + caption -> OCR -> confirm -> save
-# ---------------------------------------------------------------------------
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("Username bataiye (@username):")
+    return ASK_USERNAME
 
-def parse_caption(caption: str):
-    data = {}
-    patterns = {
-        "name": r"name\s*:\s*(.+)",
-        "username": r"username\s*:\s*(.+)",
-        "user_id": r"user\s*id\s*:\s*(\d+)",
-        "course": r"course\s*:\s*(.+)",
-    }
-    for key, pat in patterns.items():
-        m = re.search(pat, caption, re.IGNORECASE)
-        if m:
-            data[key] = m.group(1).strip()
-    return data
+
+async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["username"] = update.message.text.strip()
+    await update.message.reply_text("User ID bataiye (numeric Telegram ID):")
+    return ASK_USERID
+
+
+async def ask_userid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("User ID sirf numbers mein hona chahiye. Kripya dobara bhejein:")
+        return ASK_USERID
+    context.user_data["user_id"] = int(text)
+    await update.message.reply_text("Course ya batch ka naam bataiye:")
+    return ASK_COURSE
+
+
+async def ask_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["course"] = update.message.text.strip()
+    await update.message.reply_text("Ab payment screenshot bhejein.")
+    return ASK_SCREENSHOT
 
 
 def extract_amount_and_date(ocr_text: str):
@@ -98,18 +116,10 @@ def extract_amount_and_date(ocr_text: str):
     return amount, date_val
 
 
-@admin_only
-async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    caption = update.message.caption or ""
-    parsed = parse_caption(caption)
-
-    missing = [k for k in ("name", "username", "user_id", "course") if k not in parsed]
-    if missing:
-        await update.message.reply_text(
-            f"Caption mein ye fields missing hain: {', '.join(missing)}\n"
-            "Sahi format ke liye /addpayment check karein."
-        )
-        return
+async def ask_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Kripya payment screenshot bhejein (image format mein).")
+        return ASK_SCREENSHOT
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
@@ -125,12 +135,13 @@ async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         ocr_text = ""
 
     amount, date_val = extract_amount_and_date(ocr_text)
+    data = context.user_data
 
     PENDING[update.effective_user.id] = {
-        "name": parsed["name"],
-        "username": parsed["username"],
-        "user_id": int(parsed["user_id"]),
-        "course": parsed["course"],
+        "name": data["name"],
+        "username": data["username"],
+        "user_id": data["user_id"],
+        "course": data["course"],
         "amount": amount,
         "date": date_val,
         "screenshot_file_id": photo.file_id,
@@ -146,10 +157,10 @@ async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         f"📋 Entry Preview\n\n"
-        f"Name: {parsed['name']}\n"
-        f"Username: {parsed['username']}\n"
-        f"UserID: {parsed['user_id']}\n"
-        f"Course: {parsed['course']}\n"
+        f"Name: {data['name']}\n"
+        f"Username: {data['username']}\n"
+        f"UserID: {data['user_id']}\n"
+        f"Course: {data['course']}\n"
         f"Amount: {amount_display}\n"
         f"Date: {date_display}\n\n"
         f"Agar amount ya date incorrect hai, confirm karne se pehle correct karein:\n"
@@ -157,7 +168,19 @@ async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
+    context.user_data.clear()
+    return ConversationHandler.END
 
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Process cancel kar diya gaya hai.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# /fixamount and /fixdate - correct OCR misreads before confirming
+# ---------------------------------------------------------------------------
 
 @admin_only
 async def fix_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,6 +208,65 @@ async def fix_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Date update kar diya gaya hai: {pending['date']}")
 
 
+def parse_flexible_date(raw: str):
+    raw = raw.strip()
+    formats = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date format: {raw}")
+
+
+# ---------------------------------------------------------------------------
+# PDF Receipt generation
+# ---------------------------------------------------------------------------
+
+def generate_receipt_pdf(receipt_no, data, purchase_date):
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, BUSINESS_NAME, ln=True, align="C")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, "Payment Receipt", ln=True, align="C")
+    pdf.ln(6)
+
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "", 11)
+    rows = [
+        ("Receipt No.", receipt_no),
+        ("Date", str(purchase_date)),
+        ("Student Name", data["name"]),
+        ("Username", data["username"]),
+        ("User ID", str(data["user_id"])),
+        ("Course", data["course"]),
+        ("Amount Paid", f"Rs. {data['amount']}"),
+    ]
+    for label, value in rows:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(50, 9, label, border=0)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 9, str(value), ln=True)
+
+    pdf.ln(8)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(0, 6, "This is a system-generated receipt confirming the payment recorded above.")
+
+    filename = f"/tmp/receipt_{data['user_id']}_{receipt_no}.pdf"
+    pdf.output(filename)
+    return filename
+
+
+# ---------------------------------------------------------------------------
+# Confirm / Cancel buttons
+# ---------------------------------------------------------------------------
+
 @admin_only
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -198,7 +280,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "confirm_payment":
         if not pending:
-            await query.edit_message_text("Ye entry expire ho chuki hai, kripya screenshot dobara bhejein.")
+            await query.edit_message_text("Ye entry expire ho chuki hai, kripya /addpayment se dobara shuru karein.")
             return
         if not pending.get("amount") or not pending.get("date"):
             await query.edit_message_text(
@@ -212,7 +294,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Date sahi format mein nahi hai. Kripya /fixdate 2026-01-12 format use karein.")
             return
 
-        db.add_purchase(
+        receipt_id = db.add_purchase(
             user_id=pending["user_id"],
             name=pending["name"],
             username=pending["username"],
@@ -221,19 +303,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             purchase_date=purchase_date,
             screenshot_file_id=pending["screenshot_file_id"],
         )
+
+        pdf_path = None
+        try:
+            pdf_path = generate_receipt_pdf(receipt_id[-8:].upper(), pending, purchase_date)
+            with open(pdf_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename=f"Receipt_{pending['user_id']}.pdf",
+                    caption="📄 Payment receipt attached."
+                )
+        except Exception as e:
+            logger.error(f"Receipt generation/send failed: {e}")
+        finally:
+            if pdf_path and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+
         PENDING.pop(update.effective_user.id, None)
         await query.edit_message_text("✅ Entry safaltapoorvak save ho gayi hai.")
-
-
-def parse_flexible_date(raw: str):
-    raw = raw.strip()
-    formats = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%y"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized date format: {raw}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,13 +479,24 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addpayment", addpayment_help))
     app.add_handler(CommandHandler("check", check_user))
     app.add_handler(CommandHandler("channels", list_channels))
     app.add_handler(CommandHandler("fixamount", fix_amount))
     app.add_handler(CommandHandler("fixdate", fix_date))
 
-    app.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, handle_payment_photo))
+    addpayment_conv = ConversationHandler(
+        entry_points=[CommandHandler("addpayment", addpayment_start)],
+        states={
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
+            ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_username)],
+            ASK_USERID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_userid)],
+            ASK_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_course)],
+            ASK_SCREENSHOT: [MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), ask_screenshot)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    app.add_handler(addpayment_conv)
+
     app.add_handler(CallbackQueryHandler(channel_info_button, pattern=r"^chinfo_"))
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(confirm_payment|cancel_payment)$"))
 
