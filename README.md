@@ -37,24 +37,3 @@ git push heroku main
 
 # Worker dyno on karo (bot polling se chalta hai, web dyno nahi worker dyno chahiye)
 heroku ps:scale worker=1
-```
-
-## 5. Bot ko channels me admin banao
-Har course channel me bot ko **Administrator** banao (kam se kam ye permissions do: "Invite Users via Link", "Manage Chat"). Isi se bot join/leave events dekh payega aur invite link bana payega.
-
-## 6. Use kaise karo
-- `/addpayment` — format dekhne ke liye
-- Payment screenshot + caption bhejo:
-  ```
-  Name: Rahul Sharma
-  Username: @rahul123
-  UserID: 123456789
-  Course: Digital Marketing Batch 2
-  ```
-- Bot amount/date screenshot se khud padhega. Galat ho to `/fixamount 1499` ya `/fixdate 2026-01-12` bhejo, phir ✅ Confirm dabao.
-- `/check 123456789` — us user ki puri bio (naam history, courses, channels, join dates)
-- `/channels` — sab channels ki list, tap karo to us channel ke members dikhenge
-
-## Note
-- OCR (screenshot reading) 100% accurate nahi hoga — halke blur ya edited screenshots me amount/date miss ho sakta hai, isliye confirm se pehle check zaroor karo.
-- Heroku free tier ab available nahi hai — minimum ek Eco/Basic dyno ka cost lagega (Heroku pricing page check kar lena current rates ke liye). MongoDB Atlas ka M0 cluster free hai, uska alag se koi cost nahi.
