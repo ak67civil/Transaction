@@ -1,15 +1,36 @@
 import os
+import logging
 from datetime import datetime, time
 from pymongo import MongoClient
+
+logger = logging.getLogger(__name__)
 
 MONGODB_URI = os.environ.get("MONGODB_URI")
 
 _client = None
 
 
+def _masked_uri_debug():
+    """Logs a safe, masked version of the URI so we can see exactly what Heroku is passing in."""
+    if not MONGODB_URI:
+        return "MONGODB_URI is EMPTY/None"
+    uri = MONGODB_URI
+    has_leading_trailing_space = uri != uri.strip()
+    has_quotes = uri.startswith('"') or uri.startswith("'") or uri.endswith('"') or uri.endswith("'")
+    # mask everything between :// and @ (credentials), show only lengths
+    if "@" in uri:
+        cred_part, host_part = uri.split("@", 1)
+        masked = f"{cred_part[:12]}...(len={len(cred_part)})@{host_part}"
+    else:
+        masked = f"NO '@' FOUND — uri looks malformed, len={len(uri)}"
+    return (f"uri_len={len(uri)} leading/trailing_space={has_leading_trailing_space} "
+            f"has_quote_chars={has_quotes} preview={masked}")
+
+
 def get_db():
     global _client
     if _client is None:
+        logger.warning(f"[MongoDB debug] {_masked_uri_debug()}")
         _client = MongoClient(MONGODB_URI)
     return _client["course_bot"]
 
